@@ -15,6 +15,12 @@ on the upper line and the second one below it.
 - **Word colouring:** Japanese and English words with the same meaning get the same colour, using the free
   [JMdict](https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project) dictionary.
   Words it can't match stay uncoloured.
+- **Split lines:** a second-subtitle line that spans two main lines is shown under both.
+- **Left out:** second-subtitle lines with no main line at that time (gasps, songs…) are dropped.
+- **On-screen text** (titles, captions) in a main `.ass` file keeps its own style and position.
+- **Optional cleanup:**
+  - Remove speaker names and sound descriptions (`（テンマ）はい` → `はい`, `[knocking]` → removed).
+  - Remove Japanese reading hints (`弛緩(しかん)` → `弛緩`, read as *shikan* in romaji).
 - Reads `.srt`, `.vtt`, `.ass`; detects UTF-8 / Windows encodings (including Turkish); keeps italics and bold.
 
 ## Install
@@ -29,7 +35,8 @@ These are only needed for the Japanese features; merging works with plain Python
 
 ## Use
 
-Double-click `submerge.py`, or run `python submerge.py` to open the window:
+On Windows, double-click **`SubMerge.bat`**. On first start it installs the Japanese libraries if they
+are missing. Or run `python submerge.py`. Then:
 
 1. Choose the main subtitle (timing reference) and the second subtitle.
 2. Click **Check sync**. If the match rate is low, click the same sentence in both lists and press **Add sync point**.

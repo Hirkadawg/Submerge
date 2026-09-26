@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 # Downloaded automatically on first use of word colouring (JMdict, CC BY-SA 4.0)
-jmdict_index.json.gz
+jmdict_index*.json.gz
 # Test output
 *.ass
 *.srt

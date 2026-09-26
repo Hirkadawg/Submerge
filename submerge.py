@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import unicodedata
+import dataclasses
 from dataclasses import dataclass
 
 ENCODINGS = ['auto', 'utf-8', 'cp1254', 'cp1252', 'iso-8859-9', 'cp1250', 'cp1251',
@@ -34,6 +35,14 @@ class Cue:
     start: int  # milliseconds
     end: int
     text: str   # lines separated by '\n', may contain <i>/<b>/<font> tags
+    sign: bool = False  # on-screen text (titles, captions) from an .ass file: never paired
+    ass: tuple = None   # original .ass fields (layer, style, name, marginL, marginR, marginV, effect, text)
+
+
+class Cues(list):
+    """List of Cue's, plus the header of the .ass file it came from (if any)."""
+    play_res = None   # (x, y)
+    styles = ()       # original 'Style: ...' lines
 
 
 # ---------------------------------------------------------------- reading ---
@@ -92,10 +101,43 @@ def parse_srt_vtt(text):
     return cues
 
 
+# Style names typically used for on-screen text rather than dialogue.
+SIGN_STYLE_RE = re.compile(r'sign|title|caption|note|name|screen|karaoke|kfx|song|lyric|insert|typeset|^op|^ed',
+                           re.I)
+# Override tags that move text away from the normal bottom-centre subtitle position.
+SIGN_TAG_RE = re.compile(r'\\(?:pos|move)\(|\\an[4-9]|\\a(?:5|6|7|9|10|11)(?!\d)')
+
+
+def _ass_formatting(text):
+    r"""ASS override tags -> <i>/<b> tags; all other tags are dropped. '{\i1}x{\i0}' -> '<i>x</i>'."""
+    def block(m):
+        out = ''
+        for tag, val in re.findall(r'\\([ib])(\d*)(?=\\|\})', m.group(0)):
+            out += f'<{tag}>' if val not in ('', '0') else f'</{tag}>'
+        return out
+    t = re.sub(r'\{[^}]*\}', block, text)
+    return t.replace('\\N', '\n').replace('\\n', '\n').replace('\\h', ' ').strip()
+
+
 def parse_ass(text):
-    cues, fmt = [], None
+    cues, styles, raw_styles = Cues(), {}, []
+    fmt = style_fmt = None
+    res = {}
     for line in text.splitlines():
-        if line.startswith('Format:') and fmt is None and 'Text' in line and 'Start' in line:
+        low = line.lower()
+        if low.startswith(('playresx:', 'playresy:')):
+            res[low[7]] = int(re.sub(r'\D', '', line) or 0)
+        elif line.startswith('Format:') and 'Fontname' in line:
+            style_fmt = [f.strip().lower() for f in line[7:].split(',')]
+        elif line.startswith('Style:'):
+            raw_styles.append(line)
+            f = style_fmt or ['name', 'fontname', 'fontsize', 'primarycolour', 'secondarycolour',
+                              'outlinecolour', 'backcolour', 'bold', 'italic', 'underline', 'strikeout',
+                              'scalex', 'scaley', 'spacing', 'angle', 'borderstyle', 'outline', 'shadow',
+                              'alignment', 'marginl', 'marginr', 'marginv', 'encoding']
+            d = dict(zip(f, (p.strip() for p in line[6:].split(','))))
+            styles[d.get('name', '')] = d
+        elif line.startswith('Format:') and 'Text' in line and 'Start' in line:
             fmt = [f.strip().lower() for f in line[7:].split(',')]
         elif line.startswith('Dialogue:'):
             f = fmt or ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr',
@@ -104,19 +146,69 @@ def parse_ass(text):
             if len(parts) < len(f):
                 continue
             d = dict(zip(f, parts))
-            body = re.sub(r'\{[^}]*\}', '', d['text']).replace('\\N', '\n').replace('\\n', '\n')
-            body = body.replace('\\h', ' ').strip()
-            if body:
-                cues.append(Cue(parse_time(d['start']), parse_time(d['end']), body))
+            body = _ass_formatting(d['text'])
+            if re.sub(r'<[^>]+>', '', body).strip():
+                fields = tuple(d.get(k, '').strip() if k != 'text' else d[k]
+                               for k in ('layer', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text'))
+                cues.append(Cue(parse_time(d['start']), parse_time(d['end']), body, ass=fields))
+
+    # The most used style is the dialogue style; on-screen text is anything positioned
+    # elsewhere, or in another style that is named / aligned like a sign.
+    counts = {}
+    for c in cues:
+        counts[c.ass[1]] = counts.get(c.ass[1], 0) + 1
+    dialogue_style = max(counts, key=counts.get) if counts else ''
+    for c in cues:
+        style = c.ass[1]
+        st = styles.get(style, {})
+        if SIGN_TAG_RE.search(c.ass[7]):
+            c.sign = True
+        elif style != dialogue_style and (SIGN_STYLE_RE.search(style)
+                                          or st.get('alignment', '2') not in ('1', '2', '3')):
+            c.sign = True
+        elif st.get('italic') == '-1' and '<i>' not in c.text:
+            c.text = f'<i>{c.text}</i>'  # the style itself is italic
+    if 'x' in res or 'y' in res:  # same defaults as libass when only one is given
+        cues.play_res = (res.get('x') or res['y'] * 4 // 3, res.get('y') or res['x'] * 3 // 4)
+    else:
+        cues.play_res = (384, 288)
+    cues.styles = tuple(raw_styles)
     return cues
 
 
-def load_subtitle(path, encoding='auto'):
+# Speaker names and sound descriptions (hearing-impaired subtitles):
+#   （テンマ）はい -> はい   （ノック） -> (removed)   TENMA: Yes -> Yes   [door opens] -> (removed)
+SPEAKER_RES = (
+    re.compile(r'^(\s*[-‐]?\s*)[（(][^（()）]{1,25}[)）]\s*'),       # (Name) / (sound) at line start
+    re.compile(r'^(\s*[-‐]?\s*)[A-Z][A-Z0-9 .\'-]{1,24}:\s+'),        # NAME: at line start
+    re.compile(r'()[\[［][^\[\]［］]{1,40}[\]］]'),                       # [sound] anywhere
+)
+
+
+def remove_speakers(text):
+    lines = []
+    for line in text.split('\n'):
+        for rx in SPEAKER_RES:
+            prev = None
+            while prev != line:  # repeat: "（テンマ）（笑）はい"
+                prev, line = line, rx.sub(lambda m: m.group(1), line, count=1)
+        line = re.sub(r'  +', ' ', line).strip()
+        if re.sub(r'<[^>]+>|[-‐\s]', '', line):
+            lines.append(line)
+    return '\n'.join(lines)
+
+
+def load_subtitle(path, encoding='auto', no_speakers=False):
     text, used = read_text(path, encoding)
     if path.lower().endswith(('.ass', '.ssa')):
         cues = parse_ass(text)
     else:
-        cues = parse_srt_vtt(text)
+        cues = Cues(parse_srt_vtt(text))
+    if no_speakers:
+        for c in cues:
+            if not c.sign:
+                c.text = remove_speakers(c.text)
+        cues[:] = [c for c in cues if c.sign or c.text]
     cues.sort(key=lambda c: (c.start, c.end))
     return cues, used
 
@@ -138,12 +230,49 @@ _kakasi = None
 _tagger = False  # False = not tried yet, None = fugashi unavailable
 
 
+KANJI = re.compile(r'[㐀-鿿々]')
+HINT_RE = re.compile(r'(?<=[㐀-鿿々A-Za-z.])\([ぁ-んァ-ヶー]+\)')
+
+
 @dataclass(frozen=True)
 class JpWord:
     orig: str
     romaji: str
     keys: tuple = ()     # dictionary lookup keys, best first; empty = not a content word
     english: str = ''    # English origin of loanwords (コーヒー -> coffee), from the tokenizer
+    kana: str = ''       # reading in hiragana
+    glue: bool = False   # romaji continues into the next word without a space (だっ + た -> datta)
+
+
+def _apply_hints(words):
+    """Reading hints: 弛緩(しかん) -> one word '弛緩' read 'shikan'; Dr.(ドクター) -> 'Dr.'."""
+    out, i = [], 0
+    while i < len(words):
+        w = words[i]
+        if w.orig == '(' and out:
+            j = i + 1
+            while j < len(words) and words[j].orig != ')' and j - i <= 8:
+                j += 1
+            hint = ''.join(x.orig for x in words[i + 1:j])
+            prev = out[-1].orig[-1:]
+            if j < len(words) and words[j].orig == ')' and re.fullmatch(r'[ぁ-んァ-ヶー]+', hint) \
+                    and (KANJI.match(prev) or re.match(r'[A-Za-z.]', prev)):
+                if KANJI.match(prev):
+                    # The hint covers the last few kanji words: take words from the end until
+                    # their readings are as long as the hint.
+                    k, covered = len(out), 0
+                    while k > 0 and KANJI.search(out[k - 1].orig) and covered < len(hint):
+                        k -= 1
+                        covered += len(out[k].kana or out[k].orig)
+                    group = out[k:]
+                    orig = ''.join(x.orig for x in group)
+                    out[k:] = [JpWord(orig, _kana_to_romaji(hint), tuple(dict.fromkeys((orig,) + group[-1].keys)),
+                                      group[-1].english, _hiragana(hint), group[-1].glue)]
+                i = j + 1
+                continue
+        out.append(w)
+        i += 1
+    return out
 
 
 def _kana_to_romaji(text):
@@ -159,9 +288,10 @@ def clean_japanese(line):
 
 
 @functools.lru_cache(maxsize=8192)
-def japanese_words(line):
+def japanese_words(line, hints=False):
     """Split one line into JpWord's. Uses fugashi (real word splitting and grammar,
-    if installed) and falls back to pykakasi's rougher splitting."""
+    if installed) and falls back to pykakasi's rougher splitting.
+    hints=True: remove reading hints like 弛緩(しかん) and use them as the reading."""
     global _kakasi, _tagger
     if _kakasi is None:
         try:
@@ -178,6 +308,8 @@ def japanese_words(line):
             _tagger = None
     words = []
     if _tagger is None:
+        if hints:
+            line = HINT_RE.sub('', line)
         for item in _kakasi.convert(line):
             orig = item['orig']
             content = bool(JP_CHARS.search(orig)) and orig not in PARTICLES
@@ -199,16 +331,26 @@ def japanese_words(line):
         lemma, _, origin = (getattr(f, 'lemma', None) or '').partition('-')
         base = getattr(f, 'orthBase', None)
         if pos1 in CONTENT_POS and lemma not in SKIP_LEMMAS and base not in SKIP_LEMMAS:
-            kana = _hiragana(getattr(f, 'kanaBase', None) or '')
-            keys = tuple(dict.fromkeys(k for k in (base, lemma, s, kana) if k and k != '*'))
+            kana_base = _hiragana(getattr(f, 'kanaBase', None) or '')
+            keys = tuple(dict.fromkeys(k for k in (base, lemma, s, kana_base) if k and k != '*'))
             english = origin if origin.isascii() and origin.isalpha() else ''
-        words.append(JpWord(s, r, keys, english))
-    return tuple(words)
+        words.append(JpWord(s, r, keys, english, _hiragana(getattr(f, 'kana', None) or '')))
+    # A word ending in small っ doubles the next consonant: だっ + た -> "dat" + "ta" = "datta",
+    # and at the end of a sentence it is silent: あっ -> "a" (not "atsu").
+    for i, w in enumerate(words):
+        if w.kana.endswith('っ') and w.romaji.endswith('tsu'):
+            nxt = words[i + 1].romaji if i + 1 < len(words) and JP_CHARS.search(words[i + 1].orig) else ''
+            if re.match(r'[bcdfghjkmpqrstvwxyz]', nxt):
+                words[i] = dataclasses.replace(w, romaji=w.romaji[:-3] + ('t' if nxt.startswith('ch') else nxt[0]),
+                                               glue=True)
+            else:
+                words[i] = dataclasses.replace(w, romaji=w.romaji[:-3])
+    return tuple(_apply_hints(words) if hints else words)
 
 
-def cue_words(text):
+def cue_words(text, hints=False):
     """JpWord's of every line of a cue, as a list of lines."""
-    return [japanese_words(clean_japanese(line)) for line in text.split('\n')]
+    return [japanese_words(clean_japanese(line), hints) for line in text.split('\n')]
 
 
 def paint(s, color, fmt, base):
@@ -223,11 +365,11 @@ def bgr(rgb):
     return rgb[4:6] + rgb[2:4] + rgb[0:2]
 
 
-def render_japanese(text, romaji, colors=None, fmt='plain', base='FFFFFF'):
+def render_japanese(text, romaji, colors=None, fmt='plain', base='FFFFFF', hints=False):
     """Japanese text (optionally as romaji), with colours: {word number: 'RRGGBB'}."""
     colors = colors or {}
     out_lines, n = [], 0
-    for words in cue_words(text):
+    for words in cue_words(text, hints):
         out, glue = '', True
         for w in words:
             color = colors.get(n)
@@ -248,13 +390,13 @@ def render_japanese(text, romaji, colors=None, fmt='plain', base='FFFFFF'):
                         glue = False
             else:
                 out += ('' if glue else ' ') + paint(r, color, fmt, base)
-                glue = False
+                glue = w.glue
         out_lines.append(out.strip())
     return '\n'.join(out_lines)
 
 
-def romaji_text(text):
-    return render_japanese(text, True)
+def romaji_text(text, hints=False):
+    return render_japanese(text, True, hints=hints)
 
 
 # -------------------------------------------------------- word colouring ---
@@ -263,12 +405,26 @@ def romaji_text(text):
 STOP = set('''a an the to of in on at for from by with as into onto about be is are was were been
 being am do does did done have has had it its it's this that these those there and or but if so
 not one one's oneself someone something somebody somewhere sth sb etc esp eg ie oneself's
-let let's get got'''.split())
+let let's get got don't doesn't didn't can't cannot won't wouldn't isn't aren't wasn't weren't
+haven't hasn't hadn't couldn't shouldn't mustn't'''.split())
+STOP |= {"there's", "here's", "that's"}
+# English pronouns are only matched to the Japanese pronouns below, because many dictionary
+# phrases contain them ("I see", "excuse me") and would colour them wrongly.
+_FIRST = "i me my mine myself i'm i've i'll i'd we us our ours ourselves we're we've we'll we'd"
+_SECOND = "you your yours yourself yourselves you're you've you'll you'd"
+_HE = "he him his himself he's he'll he'd they them their theirs themselves they're they've they'll"
+_SHE = "she her hers herself she's she'll she'd"
+PRONOUN_MAP = {}
+for _words, _en in ((('私', 'わたし', 'わたくし', 'あたし', '僕', 'ぼく', '俺', 'おれ', '我', '我々', 'われわれ'), _FIRST),
+                    (('あなた', '貴方', '君', 'きみ', 'お前', 'おまえ', 'あんた', '貴様', 'てめえ'), _SECOND),
+                    (('彼', 'かれ'), _HE), (('彼女', 'かのじょ'), _SHE)):
+    PRONOUN_MAP.update(dict.fromkeys(_words, frozenset(_en.split())))
+PRONOUNS = frozenset(_FIRST.split() + _SECOND.split() + _HE.split() + _SHE.split())
 # Only allowed as the continuation of a phrase ("calm" + "down"), never as a match on their own.
 WEAK = set('up down out off away back over around along through'.split())
 PALETTE = ('66D9FF', '8CFF66', 'FF9F40', 'FF80D5', 'B38CFF', '4DFFC3', 'FF6B6B')
 EN_WORD = re.compile(r"<[^>]*>|\{[^}]*\}|([A-Za-z]+(?:'[A-Za-z]+)*)")
-DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jmdict_index.json.gz')
+DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jmdict_index_v2.json.gz')
 DICT_RELEASES = 'https://api.github.com/repos/scriptin/jmdict-simplified/releases/latest'
 
 
@@ -346,35 +502,53 @@ def download_dictionary(log=print):
     with zipfile.ZipFile(tmp) as z:
         data = json.loads(z.read(z.namelist()[0]))
     os.remove(tmp)
-    index = {}
-    for entry in data['words']:
+    def meanings(senses):
         kws = set()
-        for sense in entry['sense'][:5]:
+        for sense in senses[:3]:  # the main meanings only: rare ones cause wrong matches
             for g in sense['gloss']:
                 t = re.sub(r'\([^)]*\)', ' ', g['text'].lower())
                 kws.update(stem(w) for w in re.findall(r"[a-z]+(?:'[a-z]+)*", t) if w not in STOP)
+        return kws
+
+    index = {}
+    for entry in data['words']:
+        for k in entry['kanji']:
+            index.setdefault(k['text'], set()).update(meanings(entry['sense']))
+        # A kana spelling (はい) is shared by many words (灰 ash, 肺 lung...): only link it to
+        # words that are really written in kana, or to their kana-usage meanings.
+        if entry['kanji']:
+            kana_senses = [s for s in entry['sense'] if 'uk' in s.get('misc', [])]
+        else:
+            kana_senses = entry['sense']
+        kws = meanings(kana_senses)
         if kws:
-            for k in entry['kanji'] + entry['kana']:
+            for k in entry['kana']:
                 index.setdefault(k['text'], set()).update(kws)
+    index = {k: v for k, v in index.items() if v}
     del data
     with gzip.open(DICT_FILE, 'wt', encoding='utf-8') as f:
         json.dump({k: ' '.join(sorted(v)) for k, v in index.items()}, f, ensure_ascii=False)
     log(f'Dictionary ready: {len(index)} words.')
 
 
-def align(ja_text, en_text, dictionary):
+def align(ja_text, en_text, dictionary, hints=False):
     """Match Japanese words to English words that mean the same thing.
     Returns ({japanese word number: color}, {english word number: color})."""
-    ja = [w for line in cue_words(ja_text) for w in line]
+    ja = [w for line in cue_words(ja_text, hints) for w in line]
     en = [w.lower() for w in english_words(en_text)]
     en_stems = [None if w in STOP else stem(w) for w in en]
     used, ja_colors, en_colors = set(), {}, {}
     for i, w in enumerate(ja):
         if not w.keys:
             continue
-        meanings = dictionary.meanings(w)
-        hits = {j for j, s in enumerate(en_stems) if s and s in meanings and j not in used}
-        starts = sorted(j for j in hits if en[j] not in WEAK)
+        pronouns = next((PRONOUN_MAP[k] for k in w.keys if k in PRONOUN_MAP), None)
+        if pronouns:  # 私 -> I/me/my..., 君 -> you/your...
+            hits = {j for j, word in enumerate(en) if word in pronouns and j not in used}
+        else:
+            meanings = dictionary.meanings(w)
+            hits = {j for j, s in enumerate(en_stems)
+                    if s and s in meanings and j not in used and en[j] not in PRONOUNS}
+        starts = sorted(j for j in hits if en[j] not in WEAK or pronouns)
         if not starts:
             continue
         span = [starts[0]]
@@ -388,7 +562,8 @@ def align(ja_text, en_text, dictionary):
     return ja_colors, en_colors
 
 
-def render_event(role, text, fmt, romaji=(False, False), dictionary=None, bases=('FFFFFF', 'FFFFFF')):
+def render_event(role, text, fmt, romaji=(False, False), dictionary=None, bases=('FFFFFF', 'FFFFFF'),
+                 hints=False):
     """Returns (main, second) display texts for one event (None where absent)."""
     sides = list(text) if role == 'pair' else ([text, None] if role == 'main' else [None, text])
     colors = [{}, {}]
@@ -396,13 +571,13 @@ def render_event(role, text, fmt, romaji=(False, False), dictionary=None, bases=
         is_ja = [bool(JP_CHARS.search(s)) for s in sides]
         if is_ja[0] != is_ja[1]:  # exactly one Japanese side
             j = 0 if is_ja[0] else 1
-            colors[j], colors[1 - j] = align(sides[j], sides[1 - j], dictionary)
+            colors[j], colors[1 - j] = align(sides[j], sides[1 - j], dictionary, hints)
     out = []
     for k, s in enumerate(sides):
         if s is None:
             out.append(None)
-        elif (romaji[k] or colors[k]) and JP_CHARS.search(s):
-            out.append(render_japanese(s, romaji[k], colors[k], fmt, bases[k]))
+        elif (romaji[k] or colors[k] or hints) and JP_CHARS.search(s):
+            out.append(render_japanese(s, romaji[k], colors[k], fmt, bases[k], hints))
         else:
             out.append(render_other(s, colors[k], fmt, bases[k]))
     return out
@@ -450,6 +625,8 @@ def fmt_offset(ms):
 def estimate_sync(first, second, max_shift=300_000, bucket=100):
     """Guess offset/scale that best lines up SECOND with MAIN.
     Returns (offset_ms, scale, confidence 0..1)."""
+    first = [c for c in first if not c.sign]
+    second = [c for c in second if not c.sign]
     if not first or not second:
         return 0, 1.0, 0.0
     s1 = sorted(c.start for c in first)
@@ -479,53 +656,56 @@ def estimate_sync(first, second, max_shift=300_000, bucket=100):
 
 @dataclass
 class MergeResult:
-    events: list          # (start, end, role, text); role 'main'/'second', or 'pair' with text=(main, second)
-    matched: int
-    unmatched: int
-    main_without_second: int
+    # (start, end, role, data): role 'main' (text), 'pair' ((main text, second text)),
+    # or 'sign' (the Cue of on-screen text from the main subtitle, written unchanged)
+    events: list
+    matched: int              # second-subtitle lines shown
+    unmatched: int            # second-subtitle lines left out (no main line at that time)
+    main_without_second: int  # main lines shown without a second line
+    play_res: tuple = None    # screen size and styles of the main subtitle, if it is an .ass file
+    styles: tuple = ()
 
 
 def merge(first, second, tmap, tolerance=1000):
-    moved = [Cue(max(0, tmap(c.start)), max(0, tmap(c.end)), c.text) for c in second]
-    starts1 = [c.start for c in first]
+    """Put each second-subtitle line under the main line(s) it belongs to. A second line that
+    covers several main lines is shown under each of them; one that matches nothing is left out."""
+    dialog = [c for c in first if not c.sign]
+    moved = [Cue(max(0, tmap(c.start)), max(0, tmap(c.end)), c.text) for c in second if not c.sign]
+    starts1 = [c.start for c in dialog]
     groups = {}
-    loose = []
+    unmatched = 0
     for c in moved:
         lo = bisect.bisect_left(starts1, c.start - 15000)
         hi = bisect.bisect_right(starts1, c.end + tolerance)
-        best_i, best_ov, best_near = None, 0, None
+        covers, best, nearest = [], None, None
         for i in range(lo, hi):
-            f = first[i]
+            f = dialog[i]
             ov = min(f.end, c.end) - max(f.start, c.start)
-            if ov > best_ov:
-                best_i, best_ov = i, ov
+            f_len, c_len = max(1, f.end - f.start), max(1, c.end - c.start)
+            if ov >= 0.5 * f_len:       # this line covers most of main line i
+                covers.append(i)
+            share = ov / min(f_len, c_len)
+            if share >= 0.5 and (best is None or share > best[0]):
+                best = (share, i)       # mostly overlapping (the shorter of the two)
             d = abs(f.start - c.start)
-            if d <= tolerance and (best_near is None or d < best_near[0]):
-                best_near = (d, i)
-        ok = False
-        if best_i is not None:
-            f = first[best_i]
-            shorter = max(1, min(f.end - f.start, c.end - c.start))
-            ok = best_ov >= 0.5 * shorter or abs(f.start - c.start) <= tolerance
-        if not ok and best_near:
-            best_i, ok = best_near[1], True
-        if ok:
-            groups.setdefault(best_i, []).append(c)
-        else:
-            loose.append(c)
+            if d <= tolerance and (nearest is None or d < nearest[0]):
+                nearest = (d, i)        # starts at about the same time
+        targets = covers or ([best[1]] if best else []) or ([nearest[1]] if nearest else [])
+        for i in targets:
+            groups.setdefault(i, []).append(c)
+        unmatched += not targets
 
     events = []
-    for i, f in enumerate(first):
+    for i, f in enumerate(dialog):
         if i in groups:
             text = '\n'.join(c.text for c in sorted(groups[i], key=lambda c: c.start))
             events.append((f.start, f.end, 'pair', (f.text, text)))
         else:
             events.append((f.start, f.end, 'main', f.text))
-    for c in loose:
-        events.append((c.start, c.end, 'second', c.text))
+    events += [(c.start, c.end, 'sign', c) for c in first if c.sign]
     events.sort(key=lambda e: e[0])
-    return MergeResult(events, len(moved) - len(loose), len(loose),
-                       sum(1 for i in range(len(first)) if i not in groups))
+    return MergeResult(events, len(moved) - unmatched, unmatched, len(dialog) - len(groups),
+                       getattr(first, 'play_res', None), getattr(first, 'styles', ()))
 
 
 # ----------------------------------------------------------------- writing ---
@@ -574,61 +754,82 @@ LAYOUTS = {
 }
 
 
-def rendered_events(result, fmt, romaji, colorize, second_yellow):
-    """Yield (start, end, main_text or None, second_text or None) ready for output."""
+def rendered_events(result, fmt, romaji, colorize, second_yellow, hints=False):
+    """Yield (start, end, main_text or None, second_text or None, sign Cue or None) ready for output."""
     bases = ('FFFFFF', 'FFFF99' if second_yellow else 'FFFFFF')
     dictionary = get_dictionary() if colorize else None
-    for start, end, role, text in result.events:
-        main, second = render_event(role, text, fmt, romaji, dictionary, bases)
-        yield start, end, main, second
+    for start, end, role, data in result.events:
+        if role == 'sign':
+            yield start, end, None, None, data
+            continue
+        main, second = render_event(role, data, fmt, romaji, dictionary, bases, hints)
+        yield start, end, main, second, None
 
 
 def write_ass(path, result, layout='main_first', font='Arial', font_size=60, second_yellow=True,
-              romaji=(False, False), colorize=False):
+              romaji=(False, False), colorize=False, reading_hints=False):
     main_align, second_align = {'split': (8, 2), 'split_rev': (2, 8)}.get(layout, (2, 2))
     second_color = '&H0099FFFF' if second_yellow else '&H00FFFFFF'
-    style = '{name},{font},{size},{color},&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,{align},60,60,45,1'
+    # Keep the main subtitle's screen size so its on-screen texts stay where they were;
+    # our own sizes are given for 1080 lines and scaled to it.
+    res_x, res_y = result.play_res or (1920, 1080)
+    k = res_y / 1080
+    style = (f'{{name}},{font},{round(font_size * k)},{{color}},&H000000FF,&H00000000,&H80000000,'
+             f'0,0,0,0,100,100,0,0,1,{round(3 * k, 2)},{round(1 * k, 2)},{{align}},'
+             f'{round(60 * k)},{round(60 * k)},{round(45 * k)},1')
     lines = [
         '[Script Info]', '; Created by SubMerge', 'ScriptType: v4.00+',
-        'PlayResX: 1920', 'PlayResY: 1080', 'WrapStyle: 0', 'ScaledBorderAndShadow: yes', '',
+        f'PlayResX: {res_x}', f'PlayResY: {res_y}', 'WrapStyle: 0', 'ScaledBorderAndShadow: yes', '',
         '[V4+ Styles]',
         'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, '
         'BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, '
         'BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-        'Style: ' + style.format(name='Main', font=font, size=font_size, color='&H00FFFFFF', align=main_align),
-        'Style: ' + style.format(name='Second', font=font, size=font_size, color=second_color, align=second_align),
+        'Style: ' + style.format(name='SubMerge-Main', color='&H00FFFFFF', align=main_align),
+        'Style: ' + style.format(name='SubMerge-Second', color=second_color, align=second_align),
+        *result.styles,  # the main subtitle's own styles, used by its on-screen texts
         '', '[Events]',
         'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
     ]
     stacked = layout in ('main_first', 'second_first')
-    for start, end, main, second in rendered_events(result, 'ass', romaji, colorize, second_yellow):
+    for start, end, main, second, sign in rendered_events(result, 'ass', romaji, colorize, second_yellow,
+                                                          reading_hints):
+        t0, t1 = ass_time(start), ass_time(end)
+        if sign:
+            layer, st, name, ml, mr, mv, effect, text = sign.ass
+            lines.append(f'Dialogue: {layer},{t0},{t1},{st},{name},{ml},{mr},{mv},{effect},{text}')
+            continue
         blocks = []
         if main is not None and second is not None and stacked:
             # One event, two blocks: {\r<Style>} switches colour/font for the lower block.
             main, second = to_ass_text(main), to_ass_text(second)
             if layout == 'main_first':
-                blocks.append(('Main', f'{main}\\N{{\\rSecond}}{second}'))
+                blocks.append(('SubMerge-Main', f'{main}\\N{{\\rSubMerge-Second}}{second}'))
             else:
-                blocks.append(('Second', f'{second}\\N{{\\rMain}}{main}'))
+                blocks.append(('SubMerge-Second', f'{second}\\N{{\\rSubMerge-Main}}{main}'))
         else:
             if main is not None:
-                blocks.append(('Main', to_ass_text(main)))
+                blocks.append(('SubMerge-Main', to_ass_text(main)))
             if second is not None:
-                blocks.append(('Second', to_ass_text(second)))
+                blocks.append(('SubMerge-Second', to_ass_text(second)))
         for style_name, body in blocks:
-            lines.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},{style_name},,0,0,0,,{body}')
+            lines.append(f'Dialogue: 0,{t0},{t1},{style_name},,0,0,0,,{body}')
     with open(path, 'w', encoding='utf-8-sig', newline='\r\n') as f:
         f.write('\n'.join(lines) + '\n')
 
 
-def write_srt(path, result, layout='main_first', second_yellow=True, romaji=(False, False), colorize=False):
+def write_srt(path, result, layout='main_first', second_yellow=True, romaji=(False, False), colorize=False,
+              reading_hints=False):
     def clean(t, is_second):
         t = POS_TAG_RE.sub('', t).strip()
         return f'<font color="#FFFF99">{t}</font>' if is_second and second_yellow else t
 
     stacked = layout in ('main_first', 'second_first')
     cues = []
-    for start, end, main, second in rendered_events(result, 'srt', romaji, colorize, second_yellow):
+    for start, end, main, second, sign in rendered_events(result, 'srt', romaji, colorize, second_yellow,
+                                                          reading_hints):
+        if sign:  # on-screen text: SRT has no positioning, show it at the top
+            cues.append((start, end, '{\\an8}' + sign.text))
+            continue
         if main is not None and second is not None and stacked:
             parts = [clean(main, False), clean(second, True)]
             cues.append((start, end, '\n'.join(parts if layout == 'main_first' else parts[::-1])))
@@ -666,10 +867,14 @@ def run_cli(argv):
     p.add_argument('--romaji2', action='store_true', help='convert second (Japanese) subtitle to romaji')
     p.add_argument('--color', action='store_true',
                    help='colour Japanese/English words with the same meaning (uses JMdict)')
+    p.add_argument('--no-speakers', action='store_true',
+                   help='remove speaker names and sound descriptions: （テンマ）はい -> はい, （ノック） -> removed')
+    p.add_argument('--reading-hints', action='store_true',
+                   help='remove Japanese reading hints: 弛緩(しかん) -> 弛緩 (romaji uses the hint: shikan)')
     a = p.parse_args(argv)
 
-    first, e1 = load_subtitle(a.main, a.enc1)
-    second, e2 = load_subtitle(a.second, a.enc2)
+    first, e1 = load_subtitle(a.main, a.enc1, a.no_speakers)
+    second, e2 = load_subtitle(a.second, a.enc2, a.no_speakers)
     print(f'Main:   {len(first)} lines ({e1})\nSecond: {len(second)} lines ({e2})')
     if a.sync:
         anchors = []
@@ -687,12 +892,13 @@ def run_cli(argv):
     out = a.output or os.path.splitext(a.main)[0] + '.dual.ass'
     if a.color and not os.path.exists(DICT_FILE):
         download_dictionary()
-    opts = dict(second_yellow=not a.white, romaji=(a.romaji1, a.romaji2), colorize=a.color)
+    opts = dict(second_yellow=not a.white, romaji=(a.romaji1, a.romaji2), colorize=a.color,
+                reading_hints=a.reading_hints)
     if out.lower().endswith('.srt'):
         write_srt(out, res, a.layout, **opts)
     else:
         write_ass(out, res, a.layout, font_size=a.font_size, **opts)
-    print(f'Matched {res.matched}, unmatched {res.unmatched} second lines; '
+    print(f'Second subtitle: {res.matched} lines used, {res.unmatched} left out (no main line at that time); '
           f'{res.main_without_second} main lines have no partner.\nWrote {out}')
 
 
@@ -790,6 +996,17 @@ def run_gui():
             ttk.Checkbutton(of2, text='Colour words with the same meaning (Japanese <-> English, uses the '
                             'free JMdict dictionary; unmatched words stay uncoloured)',
                             variable=self.color_var).pack(side='left')
+            self.speakers_var = tk.BooleanVar(value=False)
+            self.hints_var = tk.BooleanVar(value=False)
+            reload_both = lambda: (self.load(0), self.load(1))  # noqa: E731
+            ttk.Checkbutton(self, variable=self.speakers_var, command=reload_both,
+                            text='Remove speaker names and sound descriptions (both subtitles), e.g. '
+                                 '"（テンマ）はい" -> "はい", "(TENMA) Yes" -> "Yes", "（ノック）" / "[knocking]" '
+                                 '-> line removed').pack(anchor='w', padx=8, pady=(2, 0))
+            ttk.Checkbutton(self, variable=self.hints_var, command=reload_both,
+                            text='Remove Japanese reading hints in brackets, e.g. "筋肉弛緩(しかん)剤" -> '
+                                 '"筋肉弛緩剤", "Dr.(ドクター)テンマ" -> "Dr.テンマ". With romaji, the hint is '
+                                 'used as the reading: "kinniku shikan zai"').pack(anchor='w', padx=8, pady=(2, 0))
 
             bf = ttk.Frame(self, padding=8)
             bf.pack(fill='x')
@@ -810,18 +1027,22 @@ def run_gui():
             if not p:
                 return
             try:
-                cues, enc = load_subtitle(p, self.enc_vars[i].get())
-                shown = [romaji_text(c.text) if self.romaji_vars[i].get() and JP_CHARS.search(c.text)
-                         else c.text for c in cues]
+                cues, enc = load_subtitle(p, self.enc_vars[i].get(), self.speakers_var.get())
+                romaji, hints = self.romaji_vars[i].get(), self.hints_var.get()
+                shown = [render_japanese(c.text, romaji, hints=hints)
+                         if (romaji or hints) and not c.sign and JP_CHARS.search(c.text) else c.text
+                         for c in cues]
             except Exception as e:
                 messagebox.showerror('Error', f'Could not read {p}:\n{e}')
                 return
+            if len(cues) != len(self.subs[i]):  # different lines: sync points no longer fit
+                self.anchors = []
             self.subs[i] = cues
             lb = self.lists[i]
             lb.delete(0, 'end')
             for c, text in zip(cues, shown):
-                lb.insert('end', f'{srt_time(c.start)}  {one_line(text)}')
-            self.anchors = [a for a in self.anchors if a[0] < len(self.subs[0]) and a[1] < len(self.subs[1])]
+                prefix = '[on-screen text, not paired] ' if c.sign else ''
+                lb.insert('end', f'{srt_time(c.start)}  {prefix}{one_line(text)}')
             self.refresh_anchors()
             self.invalidate()
             self.status.set(f'Loaded {len(cues)} lines from {os.path.basename(p)} (encoding: {enc}). '
@@ -881,6 +1102,9 @@ def run_gui():
             if not s0 or not s1:
                 messagebox.showinfo('Sync point', 'Select one line in BOTH lists first.')
                 return
+            if self.subs[0][s0[0]].sign or self.subs[1][s1[0]].sign:
+                messagebox.showinfo('Sync point', 'Please pick spoken lines, not on-screen text.')
+                return
             self.anchors = [a for a in self.anchors if a[0] != s0[0] and a[1] != s1[0]]
             self.anchors.append((s0[0], s1[0]))
             self.anchors.sort()
@@ -917,10 +1141,11 @@ def run_gui():
                 note = f' (auto confidence {self._auto[2]:.0%})'
                 if self._auto[2] < 0.15:
                     note += ' - too low, not applied: add a sync point'
-            pct = res.matched / max(1, len(self.subs[1]))
-            self.status.set(f'Timing: {tmap.describe()}{note}. Matched {res.matched}/{len(self.subs[1])} '
-                            f'second lines ({pct:.0%}); {res.unmatched} kept at their own time. '
-                            + ('Looks good.' if pct > 0.8 else 'Low match rate: add sync points.'))
+            total = res.matched + res.unmatched
+            pct = res.matched / max(1, total)
+            self.status.set(f'Timing: {tmap.describe()}{note}. Matched {res.matched}/{total} second lines '
+                            f'({pct:.0%}); {res.unmatched} have no main line at that time and are left out. '
+                            + ('Looks good.' if pct > 0.8 else 'Low match rate: check the sync or add sync points.'))
 
         def save(self):
             tmap, res = self.compute()
@@ -938,7 +1163,7 @@ def run_gui():
             colorize = self.color_var.get()
             if colorize and not self.ensure_dictionary():
                 return
-            opts = dict(second_yellow=self.yellow_var.get(), colorize=colorize,
+            opts = dict(second_yellow=self.yellow_var.get(), colorize=colorize, reading_hints=self.hints_var.get(),
                         romaji=(self.romaji_vars[0].get(), self.romaji_vars[1].get()))
             try:
                 if out.lower().endswith('.srt'):
