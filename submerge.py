@@ -408,6 +408,7 @@ not one one's oneself someone something somebody somewhere sth sb etc esp eg ie 
 let let's get got don't doesn't didn't can't cannot won't wouldn't isn't aren't wasn't weren't
 haven't hasn't hadn't couldn't shouldn't mustn't'''.split())
 STOP |= {"there's", "here's", "that's"}
+NEGATIONS = set("not no never nothing nobody none cannot can't don't doesn't won't isn't aren't without".split())
 # English pronouns are only matched to the Japanese pronouns below, because many dictionary
 # phrases contain them ("I see", "excuse me") and would colour them wrongly.
 _FIRST = "i me my mine myself i'm i've i'll i'd we us our ours ourselves we're we've we'll we'd"
@@ -424,7 +425,7 @@ PRONOUNS = frozenset(_FIRST.split() + _SECOND.split() + _HE.split() + _SHE.split
 WEAK = set('up down out off away back over around along through'.split())
 PALETTE = ('66D9FF', '8CFF66', 'FF9F40', 'FF80D5', 'B38CFF', '4DFFC3', 'FF6B6B')
 EN_WORD = re.compile(r"<[^>]*>|\{[^}]*\}|([A-Za-z]+(?:'[A-Za-z]+)*)")
-DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jmdict_index_v2.json.gz')
+DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jmdict_index_v3.json.gz')
 DICT_RELEASES = 'https://api.github.com/repos/scriptin/jmdict-simplified/releases/latest'
 
 
@@ -507,7 +508,12 @@ def download_dictionary(log=print):
         for sense in senses[:3]:  # the main meanings only: rare ones cause wrong matches
             for g in sense['gloss']:
                 t = re.sub(r'\([^)]*\)', ' ', g['text'].lower())
-                kws.update(stem(w) for w in re.findall(r"[a-z]+(?:'[a-z]+)*", t) if w not in STOP)
+                words = re.findall(r"[a-z]+(?:'[a-z]+)*", t)
+                # Skip negated phrases ("not enough" is not "enough") and hyphenated
+                # compounds ("you-know-what"); a plain "no" stays.
+                if '-' in t or (len(words) > 1 and NEGATIONS & set(words)):
+                    continue
+                kws.update(stem(w) for w in words if w not in STOP)
         return kws
 
     index = {}
@@ -532,12 +538,21 @@ def download_dictionary(log=print):
 
 
 def align(ja_text, en_text, dictionary, hints=False):
+    """Colours for matched words: ({japanese word number: color}, {english word number: color})."""
+    ja_colors, en_colors = {}, {}
+    for n, (i, span) in enumerate(match_words(ja_text, en_text, dictionary, hints)):
+        ja_colors[i] = PALETTE[n % len(PALETTE)]
+        en_colors.update(dict.fromkeys(span, ja_colors[i]))
+    return ja_colors, en_colors
+
+
+def match_words(ja_text, en_text, dictionary, hints=False):
     """Match Japanese words to English words that mean the same thing.
-    Returns ({japanese word number: color}, {english word number: color})."""
+    Returns [(japanese word number, [english word numbers]), ...]."""
     ja = [w for line in cue_words(ja_text, hints) for w in line]
     en = [w.lower() for w in english_words(en_text)]
     en_stems = [None if w in STOP else stem(w) for w in en]
-    used, ja_colors, en_colors = set(), {}, {}
+    used, pairs = set(), []
     for i, w in enumerate(ja):
         if not w.keys:
             continue
@@ -554,12 +569,9 @@ def align(ja_text, en_text, dictionary, hints=False):
         span = [starts[0]]
         while span[-1] + 1 in hits:  # "calm" + "down"
             span.append(span[-1] + 1)
-        color = PALETTE[len(ja_colors) % len(PALETTE)]
-        ja_colors[i] = color
-        for j in span:
-            en_colors[j] = color
+        pairs.append((i, span))
         used.update(span)
-    return ja_colors, en_colors
+    return pairs
 
 
 def render_event(role, text, fmt, romaji=(False, False), dictionary=None, bases=('FFFFFF', 'FFFFFF'),
@@ -766,8 +778,140 @@ def rendered_events(result, fmt, romaji, colorize, second_yellow, hints=False):
         yield start, end, main, second, None
 
 
+# --------------------------------------------------------------- hint mode ---
+# Only the main subtitle is shown; words that have a known translation get it written
+# above them in small text. ASS has no "text above a word" feature, so we measure the
+# words ourselves, wrap the lines ourselves and place every line and hint at exact positions.
+
+HINT_MODES = {'Off': None, 'Romaji': 'romaji', 'Japanese': 'japanese', 'Japanese + romaji': 'both'}
+HINT_SCALE = 0.55   # hint size relative to the subtitle size
+_tk_root = None
+
+
+def text_measurer(font, size):
+    """Returns measure(text, italic=False) -> width in script pixels for an ASS font size.
+    Uses Tk's font engine (the same Windows fonts VLC uses); an ASS font size is the
+    font's line height, which is Tk's 'linespace'."""
+    global _tk_root
+    try:
+        import tkinter
+        import tkinter.font
+        root = tkinter._default_root
+        if root is None:
+            if _tk_root is None:
+                _tk_root = tkinter.Tk()
+                _tk_root.withdraw()
+            root = _tk_root
+        fonts = {False: tkinter.font.Font(root=root, family=font, size=-200),
+                 True: tkinter.font.Font(root=root, family=font, size=-200, slant='italic')}
+        scale = size / fonts[False].metrics('linespace')
+        return lambda text, italic=False: fonts[italic].measure(text) * scale
+    except Exception:  # no Tk: rough estimate
+        return lambda text, italic=False: sum(size * (1.0 if JP_CHARS.match(c) else 0.5) for c in text)
+
+
+def _layout_rows(text, measure, max_width):
+    """Split main text into screen rows. Returns rows of tokens:
+    (x, width, text, italic, [(english word number, x0, x1), ...]) with x relative to the row start."""
+    rows, italic, n_word = [], False, 0
+    space = measure(' ')
+    for source_line in text.split('\n'):
+        tokens = []  # (text, italic) per space-separated word; italic = state at its first letter
+        for raw in source_line.split(' '):
+            lead = re.match(r'(?:<[^>]*>)*', raw).group(0)
+            for tag in re.findall(r'<(/?)i>', lead, re.I):
+                italic = not tag
+            it = italic
+            for tag in re.findall(r'<(/?)i>', raw[len(lead):], re.I):
+                italic = not tag
+            word = re.sub(r'<[^>]*>', '', raw)
+            if word:
+                tokens.append((word, it))
+        row, x = [], 0
+        for word, it in tokens:
+            w = measure(word, it)
+            spans = []
+            for m in EN_WORD.finditer(word):
+                if m.group(1):
+                    spans.append((n_word, measure(word[:m.start()], it), measure(word[:m.end()], it)))
+                    n_word += 1
+            if row and x + space + w > max_width:
+                rows.append(row)
+                row, x = [], 0
+            if row:
+                x += space
+            row.append((x, w, word, it, spans))
+            x += w
+        if row:
+            rows.append(row)
+    return rows
+
+
+def hint_dialogues(main, second, t0, t1, dictionary, mode, reading_hints, geo):
+    """Dialogue lines for one main line with hints above the words that have a translation,
+    or None when nothing matched (the caller then writes the line normally)."""
+    if not dictionary or JP_CHARS.search(main) or not JP_CHARS.search(second):
+        return None
+    pairs = match_words(second, main, dictionary, reading_hints)
+    if not pairs:
+        return None
+    ja = [w for line in cue_words(second, reading_hints) for w in line]
+
+    def word_text(i, romaji):
+        w, text = ja[i], ''
+        while True:  # 逆らっ + て -> 逆らって / sakaratte
+            text += w.romaji.strip() if romaji else w.orig
+            if not w.glue or i + 1 >= len(ja):
+                break
+            i += 1
+            w = ja[i]
+        return re.sub(r'(konnichi|konban)ha$', r'\1wa', text) if romaji else text
+
+    hint_of = {}  # english word number -> hint, for the first word of each matched phrase
+    for i, js in pairs:
+        parts = [word_text(i, False)] * (mode in ('japanese', 'both')) + [word_text(i, True)] * (mode in ('romaji', 'both'))
+        hint_of[js[0]] = (js, parts)
+
+    measure, fs, hs = geo['measure'], geo['font_size'], geo['hint_size']
+    rows = _layout_rows(main, measure, geo['res_x'] - 2 * geo['margin'])
+    hint_lines = 2 if mode == 'both' else 1
+    out, y = [], geo['res_y'] - geo['margin_v']
+    for row in reversed(rows):
+        width = row[-1][0] + row[-1][1]
+        left = (geo['res_x'] - width) / 2
+        words = {}  # english word number -> (x0, x1) on screen
+        for x, w, word, it, spans in row:
+            for j, x0, x1 in spans:
+                words[j] = (left + x + x0, left + x + x1)
+        # Main text of this row, rebuilt with italics, centred exactly where we measured it.
+        pieces, italic = [], False
+        for x, w, word, it, spans in row:
+            pieces.append(('' if it == italic else '{\\i1}' if it else '{\\i0}') + word)
+            italic = it
+        body = ' '.join(pieces)
+        out.append(f'Dialogue: 0,{t0},{t1},SubMerge-Main,,0,0,0,,{{\\an2\\pos({geo["res_x"] / 2:.0f},{y:.0f})\\q2}}{body}')
+        # Hints of this row, centred over their words, pushed apart if they would touch.
+        placed = []
+        for j, (js, parts) in sorted(hint_of.items()):
+            if j in words:
+                x0 = words[j][0]
+                x1 = max(words[k][1] for k in js if k in words)
+                hint_w = max(measure(p) for p in parts) * hs / fs
+                placed.append([(x0 + x1) / 2 - hint_w / 2, hint_w, parts])
+        for a, b in zip(placed, placed[1:]):
+            b[0] = max(b[0], a[0] + a[1] + hs * 0.4)
+        for x, hint_w, parts in placed:
+            cx = min(max(x + hint_w / 2, hint_w / 2), geo['res_x'] - hint_w / 2)
+            out.append(f'Dialogue: 1,{t0},{t1},SubMerge-Hint,,0,0,0,,'
+                       f'{{\\an2\\pos({cx:.0f},{y - fs * 0.92:.0f})}}' + '\\N'.join(parts))
+        y -= fs + (hint_lines * hs if placed else 0)
+    return out
+
+
 def write_ass(path, result, layout='main_first', font='Arial', font_size=60, second_yellow=True,
-              romaji=(False, False), colorize=False, reading_hints=False):
+              romaji=(False, False), colorize=False, reading_hints=False, hint_mode=None):
+    """hint_mode 'romaji' / 'japanese' / 'both': show only the main subtitle, with the
+    translation of matched words in small yellow text above them."""
     main_align, second_align = {'split': (8, 2), 'split_rev': (2, 8)}.get(layout, (2, 2))
     second_color = '&H0099FFFF' if second_yellow else '&H00FFFFFF'
     # Keep the main subtitle's screen size so its on-screen texts stay where they were;
@@ -790,6 +934,27 @@ def write_ass(path, result, layout='main_first', font='Arial', font_size=60, sec
         '', '[Events]',
         'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
     ]
+    if hint_mode:
+        fs = round(font_size * k)
+        hs = round(fs * HINT_SCALE)
+        lines.insert(lines.index('[Events]') - 1, 'Style: ' + style.format(
+            name='SubMerge-Hint', color='&H0099FFFF', align=2).replace(f',{fs},', f',{hs},', 1))
+        geo = dict(res_x=res_x, res_y=res_y, font_size=fs, hint_size=hs, margin=round(60 * k),
+                   margin_v=round(45 * k), measure=text_measurer(font, fs))
+        dictionary = get_dictionary()
+        for start, end, role, data in result.events:
+            t0, t1 = ass_time(start), ass_time(end)
+            if role == 'sign':
+                layer, st, name, ml, mr, mv, effect, text = data.ass
+                lines.append(f'Dialogue: {layer},{t0},{t1},{st},{name},{ml},{mr},{mv},{effect},{text}')
+                continue
+            main = POS_TAG_RE.sub('', data[0] if role == 'pair' else data).strip()
+            hinted = role == 'pair' and hint_dialogues(main, data[1], t0, t1, dictionary, hint_mode,
+                                                       reading_hints, geo)
+            lines += hinted or [f'Dialogue: 0,{t0},{t1},SubMerge-Main,,0,0,0,,{to_ass_text(main)}']
+        with open(path, 'w', encoding='utf-8-sig', newline='\r\n') as f:
+            f.write('\n'.join(lines) + '\n')
+        return
     stacked = layout in ('main_first', 'second_first')
     for start, end, main, second, sign in rendered_events(result, 'ass', romaji, colorize, second_yellow,
                                                           reading_hints):
@@ -871,7 +1036,12 @@ def run_cli(argv):
                    help='remove speaker names and sound descriptions: （テンマ）はい -> はい, （ノック） -> removed')
     p.add_argument('--reading-hints', action='store_true',
                    help='remove Japanese reading hints: 弛緩(しかん) -> 弛緩 (romaji uses the hint: shikan)')
+    p.add_argument('--hint-mode', choices=['romaji', 'japanese', 'both'],
+                   help='show only the main subtitle, with the Japanese of matched words in small text '
+                        'above them (.ass output only)')
     a = p.parse_args(argv)
+    if a.hint_mode and a.output and a.output.lower().endswith('.srt'):
+        p.error('hint mode only works with .ass output (.srt cannot place text above words)')
 
     first, e1 = load_subtitle(a.main, a.enc1, a.no_speakers)
     second, e2 = load_subtitle(a.second, a.enc2, a.no_speakers)
@@ -890,14 +1060,14 @@ def run_cli(argv):
         tmap = TimeMap()
     res = merge(first, second, tmap, a.tolerance)
     out = a.output or os.path.splitext(a.main)[0] + '.dual.ass'
-    if a.color and not os.path.exists(DICT_FILE):
+    if (a.color or a.hint_mode) and not os.path.exists(DICT_FILE):
         download_dictionary()
     opts = dict(second_yellow=not a.white, romaji=(a.romaji1, a.romaji2), colorize=a.color,
                 reading_hints=a.reading_hints)
     if out.lower().endswith('.srt'):
         write_srt(out, res, a.layout, **opts)
     else:
-        write_ass(out, res, a.layout, font_size=a.font_size, **opts)
+        write_ass(out, res, a.layout, font_size=a.font_size, hint_mode=a.hint_mode, **opts)
     print(f'Second subtitle: {res.matched} lines used, {res.unmatched} left out (no main line at that time); '
           f'{res.main_without_second} main lines have no partner.\nWrote {out}')
 
@@ -996,6 +1166,12 @@ def run_gui():
             ttk.Checkbutton(of2, text='Colour words with the same meaning (Japanese <-> English, uses the '
                             'free JMdict dictionary; unmatched words stay uncoloured)',
                             variable=self.color_var).pack(side='left')
+            self.hint_var = tk.StringVar(value='Off')
+            ttk.Label(of2, text='   Hint mode:').pack(side='left')
+            hint_cb = ttk.Combobox(of2, textvariable=self.hint_var, values=list(HINT_MODES), width=18,
+                                   state='readonly')
+            hint_cb.pack(side='left')
+            hint_cb.bind('<<ComboboxSelected>>', self.hint_mode_selected)
             self.speakers_var = tk.BooleanVar(value=False)
             self.hints_var = tk.BooleanVar(value=False)
             reload_both = lambda: (self.load(0), self.load(1))  # noqa: E731
@@ -1159,9 +1335,16 @@ def run_gui():
                 filetypes=[('ASS subtitle (recommended)', '*.ass'), ('SRT subtitle', '*.srt')])
             if not out:
                 return
+            hint_mode = HINT_MODES[self.hint_var.get()]
+            if hint_mode and out.lower().endswith('.srt'):
+                if not messagebox.askyesno('Hint mode needs .ass',
+                                           'Hint mode only works with .ass files (.srt cannot place text '
+                                           'above words).\n\nSave as .ass instead?'):
+                    return
+                out = out[:-4] + '.ass'
             layout = LAYOUTS[self.pos_var.get()]
             colorize = self.color_var.get()
-            if colorize and not self.ensure_dictionary():
+            if (colorize or hint_mode) and not self.ensure_dictionary():
                 return
             opts = dict(second_yellow=self.yellow_var.get(), colorize=colorize, reading_hints=self.hints_var.get(),
                         romaji=(self.romaji_vars[0].get(), self.romaji_vars[1].get()))
@@ -1169,7 +1352,7 @@ def run_gui():
                 if out.lower().endswith('.srt'):
                     write_srt(out, res, layout, **opts)
                 else:
-                    write_ass(out, res, layout, font_size=self.size_var.get(), **opts)
+                    write_ass(out, res, layout, font_size=self.size_var.get(), hint_mode=hint_mode, **opts)
             except Exception as e:
                 messagebox.showerror('Error', f'Could not save:\n{e}')
                 return
@@ -1177,6 +1360,17 @@ def run_gui():
             messagebox.showinfo('Saved', f'Saved:\n{out}\n\nIn VLC: Subtitle > Add Subtitle File...\n'
                                 'Tip: name it exactly like the video (movie.mkv -> movie.ass) and VLC '
                                 'loads it automatically.')
+
+        def hint_mode_selected(self, _=None):
+            if HINT_MODES[self.hint_var.get()]:
+                messagebox.showinfo(
+                    'Hint mode',
+                    'Hint mode shows only the main (English) subtitle. Words whose Japanese translation '
+                    'is known get it in small yellow text right above them; the second subtitle itself '
+                    'is not shown.\n\n'
+                    'Note: hint mode only works with .ass output. .srt files cannot place text above '
+                    'words, so save as .ass.\n\n'
+                    'The layout, colour and "second subtitle in yellow" settings are not used in hint mode.')
 
         def ensure_dictionary(self):
             if os.path.exists(DICT_FILE):

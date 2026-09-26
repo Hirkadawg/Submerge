@@ -15,6 +15,8 @@ on the upper line and the second one below it.
 - **Word colouring:** Japanese and English words with the same meaning get the same colour, using the free
   [JMdict](https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project) dictionary.
   Words it can't match stay uncoloured.
+- **Hint mode** (`.ass` only): shows only the main (English) subtitle, with the Japanese of matched words
+  in small yellow text right above them, as romaji, Japanese, or both.
 - **Split lines:** a second-subtitle line that spans two main lines is shown under both.
 - **Left out:** second-subtitle lines with no main line at that time (gasps, songs…) are dropped.
 - **On-screen text** (titles, captions) in a main `.ass` file keeps its own style and position.
