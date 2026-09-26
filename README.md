@@ -30,17 +30,18 @@ on the upper line and the second one below it.
 Requires Python 3.9+. Licensed under the MIT License (see `LICENSE`).
 
 ```bash
-python -m pip install pykakasi fugashi unidic-lite
+python -m pip install pykakasi fugashi unidic-lite tkinterdnd2
 ```
 
-These are only needed for the Japanese features; merging works with plain Python.
+These are only needed for the Japanese features and drag & drop; merging works with plain Python.
 
 ## Use
 
 On Windows, double-click **`SubMerge.bat`**. On first start it installs the Japanese libraries if they
 are missing. Or run `python submerge.py`. Then:
 
-1. Choose the main subtitle (timing reference) and the second subtitle.
+1. Choose the main subtitle (timing reference) and the second subtitle, with **Browse…** or by dragging
+   the files onto the left (main) and right (second) lists.
 2. Click **Check sync**. If the match rate is low, click the same sentence in both lists and press **Add sync point**.
 3. Click **Merge & Save…** and load the `.ass` file in VLC (*Subtitle → Add Subtitle File…*). If you name it like the video (`movie.mkv` → `movie.ass`), VLC loads it automatically.
 

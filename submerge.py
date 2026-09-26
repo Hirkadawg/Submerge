@@ -1077,11 +1077,17 @@ def run_cli(argv):
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    try:  # optional: drag & drop of subtitle files (python -m pip install tkinterdnd2)
+        from tkinterdnd2 import TkinterDnD, DND_FILES
+        base_window = TkinterDnD.Tk
+    except ImportError:
+        TkinterDnD = DND_FILES = None
+        base_window = tk.Tk
 
     def one_line(text):
         return re.sub(r'<[^>]+>|\{[^}]*\}', '', text).replace('\n', ' / ')
 
-    class App(tk.Tk):
+    class App(base_window):
         def __init__(self):
             super().__init__()
             self.title('SubMerge - dual subtitles')
@@ -1117,6 +1123,8 @@ def run_gui():
                 head = ttk.Frame(f)
                 head.pack(fill='x')
                 ttk.Label(head, text=title, font=('Segoe UI', 10, 'bold')).pack(side='left')
+                if DND_FILES:
+                    ttk.Label(head, text='  (drag & drop a file here)', foreground='gray').pack(side='left')
                 sv = tk.StringVar()
                 ent = ttk.Entry(head, textvariable=sv, width=28)
                 ent.pack(side='right')
@@ -1131,6 +1139,10 @@ def run_gui():
                 sb.pack(side='right', fill='y')
                 lb.pack(fill='both', expand=True)
                 self.lists.append(lb)
+                if DND_FILES:  # a file dropped on the left side is the main subtitle, right side the second
+                    for widget in (f, head, *head.winfo_children(), body, lb):
+                        widget.drop_target_register(DND_FILES)
+                        widget.dnd_bind('<<Drop>>', lambda e, i=i: self.dropped(i, e.data))
             mid.columnconfigure((0, 1), weight=1, uniform='x')
             mid.rowconfigure(0, weight=1)
             self.lists[0].bind('<<ListboxSelect>>', self.follow_main)
@@ -1192,6 +1204,13 @@ def run_gui():
             ttk.Label(bf, textvariable=self.status, wraplength=850).pack(side='left')
 
         # -- loading
+        def dropped(self, i, data):
+            files = self.tk.splitlist(data)  # paths with spaces arrive as {C:/my folder/a.srt}
+            if files:
+                self.path_vars[i].set(files[0])
+                self.load(i)
+            return 'copy'
+
         def browse(self, i):
             p = filedialog.askopenfilename(filetypes=[('Subtitles', '*.srt *.vtt *.ass *.ssa'), ('All', '*.*')])
             if p:

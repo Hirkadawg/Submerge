@@ -10,13 +10,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem First run only: install the libraries used for romaji and word colouring.
-python -c "import pykakasi, fugashi, unidic_lite" >nul 2>nul
+rem First run only: install the libraries used for romaji, word colouring and drag and drop.
+python -c "import pykakasi, fugashi, unidic_lite, tkinterdnd2" >nul 2>nul
 if errorlevel 1 (
-    echo Installing the Japanese libraries - first run only, please wait...
-    python -m pip install pykakasi fugashi unidic-lite
+    echo Installing the libraries SubMerge uses - first run only, please wait...
+    python -m pip install pykakasi fugashi unidic-lite tkinterdnd2
     if errorlevel 1 (
-        echo Installation failed. SubMerge still works, but without romaji and word colouring.
+        echo Installation failed. SubMerge still works, but without romaji, word colouring
+        echo and drag and drop.
         pause
     )
 )
