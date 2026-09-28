@@ -179,8 +179,9 @@ def parse_ass(text):
 # Speaker names and sound descriptions (hearing-impaired subtitles):
 #   （テンマ）はい -> はい   （ノック） -> (removed)   TENMA: Yes -> Yes   [door opens] -> (removed)
 SPEAKER_RES = (
-    re.compile(r'^(\s*[-‐]?\s*)[（(][^（()）]{1,25}[)）]\s*'),       # (Name) / (sound) at line start
-    re.compile(r'^(\s*[-‐]?\s*)[A-Z][A-Z0-9 .\'-]{1,24}:\s+'),        # NAME: at line start
+    # (Name) / (sound) at line start, also after position tags like {\an8}
+    re.compile(r'^((?:\{[^}]*\})*\s*[-‐]?\s*)[（(][^（()）]{1,25}[)）]\s*'),
+    re.compile(r'^((?:\{[^}]*\})*\s*[-‐]?\s*)[A-Z][A-Z0-9 .\'-]{1,24}:\s+'),  # NAME: at line start
     re.compile(r'()[\[［][^\[\]［］]{1,40}[\]］]'),                       # [sound] anywhere
 )
 
@@ -193,7 +194,7 @@ def remove_speakers(text):
             while prev != line:  # repeat: "（テンマ）（笑）はい"
                 prev, line = line, rx.sub(lambda m: m.group(1), line, count=1)
         line = re.sub(r'  +', ' ', line).strip()
-        if re.sub(r'<[^>]+>|[-‐\s]', '', line):
+        if re.sub(r'<[^>]+>|\{[^}]*\}|[-‐\s]', '', line):
             lines.append(line)
     return '\n'.join(lines)
 
@@ -224,6 +225,9 @@ JP_CHARS = re.compile(r'[぀-ヿ㐀-鿿]')
 # Word types worth looking up in the dictionary (nouns, verbs, adjectives, adverbs...).
 CONTENT_POS = {'名詞', '代名詞', '動詞', '形容詞', '形状詞', '副詞', '感動詞', '連体詞'}
 # Grammar-like verbs/nouns ("to do", "to be", "thing") that would only give false matches.
+# Helper verbs after て/で are grammar, not meaning: 生き返らせてしまった = "ended up reviving".
+AUX_AFTER_TE = {'仕舞う', 'しまう', 'ちゃう', '居る', 'いる', '置く', 'おく', '見る', 'みる', '上げる', 'あげる',
+                '呉れる', 'くれる', '貰う', 'もらう', '有る', 'ある'}
 SKIP_LEMMAS = {'為る', 'する', '居る', 'いる', '有る', 'ある', '在る', '成る', 'なる', '事', 'こと',
                '物', 'もの', '方', 'ほう', '其れ', 'それ', '此れ', 'これ', '彼れ', 'あれ', '其の', 'その', '此の', 'この'}
 _kakasi = None
@@ -242,6 +246,7 @@ class JpWord:
     english: str = ''    # English origin of loanwords (コーヒー -> coffee), from the tokenizer
     kana: str = ''       # reading in hiragana
     glue: bool = False   # romaji continues into the next word without a space (だっ + た -> datta)
+    minor: bool = False  # interjection / demonstrative (あの, ええ): loses ties against content words
 
 
 def _apply_hints(words):
@@ -330,11 +335,14 @@ def japanese_words(line, hints=False):
         keys, english = (), ''
         lemma, _, origin = (getattr(f, 'lemma', None) or '').partition('-')
         base = getattr(f, 'orthBase', None)
-        if pos1 in CONTENT_POS and lemma not in SKIP_LEMMAS and base not in SKIP_LEMMAS:
+        after_te = bool(words) and words[-1].orig in ('て', 'で')
+        helper = after_te and (lemma in AUX_AFTER_TE or base in AUX_AFTER_TE)
+        if pos1 in CONTENT_POS and lemma not in SKIP_LEMMAS and base not in SKIP_LEMMAS and not helper:
             kana_base = _hiragana(getattr(f, 'kanaBase', None) or '')
             keys = tuple(dict.fromkeys(k for k in (base, lemma, s, kana_base) if k and k != '*'))
             english = origin if origin.isascii() and origin.isalpha() else ''
-        words.append(JpWord(s, r, keys, english, _hiragana(getattr(f, 'kana', None) or '')))
+        words.append(JpWord(s, r, keys, english, _hiragana(getattr(f, 'kana', None) or ''),
+                            minor=pos1 in ('感動詞', '連体詞')))
     # A word ending in small っ doubles the next consonant: だっ + た -> "dat" + "ta" = "datta",
     # and at the end of a sentence it is silent: あっ -> "a" (not "atsu").
     for i, w in enumerate(words):
@@ -425,15 +433,31 @@ PRONOUNS = frozenset(_FIRST.split() + _SECOND.split() + _HE.split() + _SHE.split
 WEAK = set('up down out off away back over around along through'.split())
 PALETTE = ('66D9FF', '8CFF66', 'FF9F40', 'FF80D5', 'B38CFF', '4DFFC3', 'FF6B6B')
 EN_WORD = re.compile(r"<[^>]*>|\{[^}]*\}|([A-Za-z]+(?:'[A-Za-z]+)*)")
-DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jmdict_index_v3.json.gz')
+DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jmdict_index_v5.json.gz')
 DICT_RELEASES = 'https://api.github.com/repos/scriptin/jmdict-simplified/releases/latest'
 
 
+# Irregular English verb forms -> base form, so "said" matches the dictionary's "to say".
+IRREGULAR = dict(pair.split(":") for pair in """
+said:say went:go gone:go came:come saw:see seen:see took:take taken:take knew:know known:know
+told:tell thought:think brought:bring found:find gave:give given:give left:leave felt:feel heard:hear
+kept:keep made:make met:meet ran:run sat:sit spoke:speak spoken:speak stood:stand understood:understand
+wrote:write written:write ate:eat eaten:eat drank:drink drunk:drink slept:sleep shot:shoot began:begin
+begun:begin broke:break broken:break forgot:forget forgotten:forget lost:lose paid:pay sent:send
+taught:teach won:win woke:wake hid:hide hidden:hide fell:fall fallen:fall held:hold caught:catch
+bought:buy fought:fight meant:mean sold:sell did:do done:do chose:choose chosen:choose drove:drive
+driven:drive flew:fly flown:fly grew:grow grown:grow threw:throw thrown:throw wore:wear worn:wear
+spent:spend built:build lent:lend lay:lie led:lead fed:feed sought:seek stole:steal stolen:steal
+""".split())
+
+
 def stem(word):
-    """Very small English stemmer: 'emergencies' -> 'emergency', 'calmed' -> 'calm'."""
+    """Very small English stemmer: 'emergencies' -> 'emergency', 'calmed' -> 'calm', 'said' -> 'say'."""
     w = word.lower()
+    w = IRREGULAR.get(w, w)
     for suf, rep in (('ies', 'y'), ('ied', 'y'), ('ying', 'y'), ('ing', ''), ('ed', ''), ('es', ''), ('s', '')):
-        if w.endswith(suf) and len(w) - len(suf) >= (2 if suf == 'ing' else 3):  # going -> go
+        if w.endswith(suf) and len(w) - len(suf) >= (2 if suf == 'ing' else 3) \
+                and re.search('[aeiouy]', w[:-len(suf)]):  # going -> go, but bring stays bring
             w = w[:-len(suf)] + rep
             if suf in ('ing', 'ed') and len(w) > 3 and w[-1] == w[-2] and w[-1] not in 'aeiouls':
                 w = w[:-1]  # stopped -> stop
@@ -447,6 +471,17 @@ def english_words(text):
     return [m.group(1) for m in EN_WORD.finditer(text) if m.group(1)]
 
 
+def standalone_words(text):
+    """Per English word: True if it stands on its own - starts a phrase and is followed by
+    punctuation ('Um...', 'Oh, go ahead', 'No!') - where interjections like あの / はい belong."""
+    plain = re.sub(r'<[^>]*>|\{[^}]*\}', '', text)
+    out = []
+    for m in re.finditer(r"[A-Za-z]+(?:'[A-Za-z]+)*", plain):
+        before, after = plain[:m.start()].rstrip(), plain[m.end():].lstrip()
+        out.append((not before or before[-1] in '.,!?;:-…"') and (not after or after[0] in '.,!?;:-…"'))
+    return out
+
+
 def render_other(text, colors, fmt, base):
     counter = iter(range(10 ** 9))
 
@@ -458,20 +493,21 @@ def render_other(text, colors, fmt, base):
 
 
 class Dictionary:
-    """JMdict, reduced to {japanese word: stems of its English meanings}."""
+    """JMdict, reduced to {japanese word: stems of its English meanings, main meaning first}."""
 
     def __init__(self, path=DICT_FILE):
         with gzip.open(path, 'rt', encoding='utf-8') as f:
             self.index = json.load(f)
 
     def meanings(self, w):
-        kws = set()
+        """{stem: rank}; rank 0 is the word's main meaning, higher numbers are weaker meanings."""
+        kws = {}
         for k in w.keys:
             if k in self.index:
-                kws = set(self.index[k].split())
+                kws = {s: n for n, s in reversed(list(enumerate(self.index[k].split())))}
                 break
         if w.english:
-            kws.add(stem(w.english))
+            kws[stem(w.english)] = 0
         return kws
 
 
@@ -504,7 +540,7 @@ def download_dictionary(log=print):
         data = json.loads(z.read(z.namelist()[0]))
     os.remove(tmp)
     def meanings(senses):
-        kws = set()
+        kws = {}  # ordered: main meaning first
         for sense in senses[:3]:  # the main meanings only: rare ones cause wrong matches
             for g in sense['gloss']:
                 t = re.sub(r'\([^)]*\)', ' ', g['text'].lower())
@@ -513,13 +549,13 @@ def download_dictionary(log=print):
                 # compounds ("you-know-what"); a plain "no" stays.
                 if '-' in t or (len(words) > 1 and NEGATIONS & set(words)):
                     continue
-                kws.update(stem(w) for w in words if w not in STOP)
+                kws.update(dict.fromkeys(stem(w) for w in words if w not in STOP))
         return kws
 
     index = {}
     for entry in data['words']:
         for k in entry['kanji']:
-            index.setdefault(k['text'], set()).update(meanings(entry['sense']))
+            index.setdefault(k['text'], {}).update(meanings(entry['sense']))
         # A kana spelling (はい) is shared by many words (灰 ash, 肺 lung...): only link it to
         # words that are really written in kana, or to their kana-usage meanings.
         if entry['kanji']:
@@ -529,11 +565,11 @@ def download_dictionary(log=print):
         kws = meanings(kana_senses)
         if kws:
             for k in entry['kana']:
-                index.setdefault(k['text'], set()).update(kws)
+                index.setdefault(k['text'], {}).update(kws)
     index = {k: v for k, v in index.items() if v}
     del data
     with gzip.open(DICT_FILE, 'wt', encoding='utf-8') as f:
-        json.dump({k: ' '.join(sorted(v)) for k, v in index.items()}, f, ensure_ascii=False)
+        json.dump({k: ' '.join(v) for k, v in index.items()}, f, ensure_ascii=False)
     log(f'Dictionary ready: {len(index)} words.')
 
 
@@ -552,26 +588,33 @@ def match_words(ja_text, en_text, dictionary, hints=False):
     ja = [w for line in cue_words(ja_text, hints) for w in line]
     en = [w.lower() for w in english_words(en_text)]
     en_stems = [None if w in STOP else stem(w) for w in en]
-    used, pairs = set(), []
+    alone = standalone_words(en_text)
+    hits, candidates = {}, []
     for i, w in enumerate(ja):
         if not w.keys:
             continue
         pronouns = next((PRONOUN_MAP[k] for k in w.keys if k in PRONOUN_MAP), None)
         if pronouns:  # 私 -> I/me/my..., 君 -> you/your...
-            hits = {j for j, word in enumerate(en) if word in pronouns and j not in used}
+            hits[i] = {j: 0 for j, word in enumerate(en) if word in pronouns}
         else:
             meanings = dictionary.meanings(w)
-            hits = {j for j, s in enumerate(en_stems)
-                    if s and s in meanings and j not in used and en[j] not in PRONOUNS}
-        starts = sorted(j for j in hits if en[j] not in WEAK or pronouns)
-        if not starts:
+            hits[i] = {j: meanings[s] for j, s in enumerate(en_stems)
+                       if s and s in meanings and en[j] not in PRONOUNS and (alone[j] or not w.minor)}
+        penalty = 0.5 if w.minor else 0  # あの 'say' (interjection) loses to 言う 'say'
+        candidates += [(rank + penalty, i, j) for j, rank in hits[i].items() if en[j] not in WEAK or pronouns]
+    # Strongest matches first: a word's main meaning beats another word's side meaning
+    # (言う "say" gets "says" before あの, whose rare meanings also include "say").
+    used_ja, used_en, pairs = set(), set(), []
+    for rank, i, j in sorted(candidates):
+        if i in used_ja or j in used_en:
             continue
-        span = [starts[0]]
-        while span[-1] + 1 in hits:  # "calm" + "down"
+        span = [j]
+        while span[-1] + 1 in hits[i] and span[-1] + 1 not in used_en:  # "calm" + "down"
             span.append(span[-1] + 1)
         pairs.append((i, span))
-        used.update(span)
-    return pairs
+        used_ja.add(i)
+        used_en.update(span)
+    return sorted(pairs)
 
 
 def render_event(role, text, fmt, romaji=(False, False), dictionary=None, bases=('FFFFFF', 'FFFFFF'),
