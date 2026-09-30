@@ -1,8 +1,31 @@
+# Python cache and virtual environments
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
 # Downloaded automatically on first use of word colouring (JMdict, CC BY-SA 4.0)
 jmdict_index*.json.gz
-# Test output
+
+# Test output / personal subtitle files
 *.ass
+*.ssa
 *.srt
 *.vtt
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE settings
+.vscode/
+.idea/
+*.swp
+.claude/
